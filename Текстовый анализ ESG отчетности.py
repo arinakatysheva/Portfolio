@@ -1,0 +1,381 @@
+import pandas as pd
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
+import re
+
+# 1. СОЗДАЕМ УЧЕБНЫЕ ДАННЫЕ ДЛЯ МОДЕЛИ
+
+def create_annotation_dataset():
+    data = []
+    
+    # Примеры из приложения к статьи (Table C.1, C.2, C.3, C.4)
+    examples = [
+        # ПРИМЕРЫ СВЯЗАННЫЕ С КЛИМАТОМ
+        {
+            'text': "Устойчивое развитие: Группа подчиняется строгим законам в области устойчивого развития, включая управление охраной окружающей среды и изменение климата, в частности ограничение выбросов.",
+            'climate_related': 1,        # Да, текст о климате
+            'sentiment': 'risk',         # Тон: риски (негативный)
+            'commitment': 0,             # Нет, это не обещание
+            'specific': 0                # Нет, не конкретно
+        },
+        {
+            'text': "Выбросы категории 3: Добровольная категория, включающая косвенные выбросы, связанные с цепочкой поставок товаров и услуг.",
+            'climate_related': 1,        # Да, о климате
+            'sentiment': 'neutral',      # Тон: нейтральный
+            'commitment': 0,             # Нет обещаний
+            'specific': 0                # Не конкретно
+        },
+        
+        # ПРИМЕРЫ С ОБЕЩАНИЯМИ
+        {
+            'text': "Этот клиент пока не соответствует нашей политике устойчивого развития. Установлены конкретные соглашения о возможном решении и срокаи.",
+            'climate_related': 1,        # Да, о климате
+            'sentiment': 'neutral',      # Тон: нейтральный
+            'commitment': 1,             # Да, есть обещание
+            'specific': 1                # Да, конкретно (сроки и соглашения)
+        },
+        {
+            'text': "Мы не инвестируем в компании ископаемого топлива, но те инвесторы, которые это делают, должны правильно учитывать свою роль в производстве опасных выбросов.",
+            'climate_related': 1,        # Да, о климате
+            'sentiment': 'neutral',      # Тон: нейтральный
+            'commitment': 1,             # Да, есть обещание (не инвестируем)
+            'specific': 0                # Нет, не конкретно (общее заявление)
+        },
+        
+        # КОНКРЕТНЫЕ И РАСПЫВЧАТЫЕ ПРИМЕРЫ
+        {
+            'text': "Volkswagen Financial Services предоставляет 450 тысяч евро для восстановления реки Аллер. Цель - создать более естественные условия для русла реки и поймы.",
+            'climate_related': 1,        # Да, о климате
+            'sentiment': 'opportunity',  # Тон: возможности (позитивный)
+            'commitment': 1,             # Да, есть обещание
+            'specific': 1                # Да, конкретно (точная сумма и цель)
+        },
+        {
+            'text': "Ключевые вопросы для нашей компании включают сокращение использования электроэнергии и газа, уменьшение отходов и увеличение переработки на наших объектах.",
+            'climate_related': 1,        # Да, о климате
+            'sentiment': 'opportunity',  # Тон: возможности
+            'commitment': 1,             # Да, есть обещание
+            'specific': 0                # Нет, не конкретно (нет цифр и сроков)
+        },
+        
+        # ПРИМЕРЫ НЕ О КЛИМАТЕ
+        {
+            'text': "Операционный риск - это риск убытков в результате неадекватных или failed внутренних процессов, людей и систем или внешних событий.",
+            'climate_related': 0,        # Нет, не о климате
+            'sentiment': 'neutral',      # Тон: нейтральный
+            'commitment': 0,             # Нет обещаний
+            'specific': 0                # Не конкретно
+        }
+    ]
+    
+    # Добавляем аналогичные примеры
+    additional_examples = [
+        # Пример конкретных обещаний
+        {
+            'text': "Мы обязуемся сократить наши углеродные выбросы на 50% к 2030 году путем инвестирования 100 миллионов долларов в проекты возобновляемой энергии.",
+            'climate_related': 1,
+            'sentiment': 'opportunity',
+            'commitment': 1,
+            'specific': 1  # Конкретно: цифры, сроки, сумма
+        },
+        
+        # Пример расплывчатых обещаний
+        {
+            'text': "Мы поддерживаем экологическую устойчивость и будем работать над сокращением нашего экологического следа.",
+            'climate_related': 1,
+            'sentiment': 'opportunity', 
+            'commitment': 1,
+            'specific': 0  # Расплывчато: нет цифр и сроков
+        },
+        
+        # Пример не о климате
+        {
+            'text': "Финансовые результаты компании показали рост выручки на 15% в прошлом квартале.",
+            'climate_related': 0,
+            'sentiment': 'neutral',
+            'commitment': 0,
+            'specific': 0
+        }
+    ]
+    
+    return pd.DataFrame(examples + additional_examples)
+
+# Создаем учебный датасет
+dataset = create_annotation_dataset()
+print(f"Размер: {len(dataset)} примеров")
+print(f"Climate-related: {dataset['climate_related'].sum()} текстов")
+print(f"Commitments: {dataset['commitment'].sum()} обещаний")
+print(f"Specific commitments: {dataset[dataset['commitment'] == 1]['specific'].sum()} конкретных")
+
+# 2. СОЗДАЕМ МОДЕЛЬ ДЛЯ АНАЛИЗА "ДЕШЕВЫХ РАЗГОВОРОВ"
+
+class ClimateCheapTalkModel:
+    def __init__(self):
+        """Инициализация модели с использованием доступных компонентов"""
+        try:
+            # Используем базовую модель для токенизации
+            self.tokenizer = AutoTokenizer.from_pretrained("roberta-base")
+            print("Токенизатор загружен")
+        except:
+            print("Не удалось загрузить токенизатор, используем rule-based подход")
+            self.tokenizer = None
+        
+        # Инициализируем классификатор тональности
+        try:
+            self.sentiment_analyzer = pipeline(
+                "sentiment-analysis",
+                model="siebert/sentiment-roberta-large-english"
+            )
+            print("Анализатор тональности загружен")
+        except:
+            print("Не удалось загрузить анализатор тональности")
+            self.sentiment_analyzer = None
+        
+    def predict_climate(self, text):
+        """Определяем, относится ли текст к климатической тематике"""
+        # Ключевые слова для определения климатических текстов
+        climate_keywords = [
+            'climate', 'emission', 'carbon', 'sustainable', 'environmental',
+            'green', 'renewable', 'energy', 'eco', 'footprint',
+            'климат', 'выброс', 'углерод', 'устойчив', 'экологич',
+            'зелен', 'возобновля', 'энерг', 'эко', 'след'
+        ]
+        
+        text_lower = text.lower()
+        # Текст считается климатическим, если содержит хотя бы 2 ключевых слова
+        keyword_count = sum(1 for keyword in climate_keywords if keyword in text_lower)
+        return keyword_count >= 2
+    
+    def predict_sentiment(self, text):
+        """Анализируем тональность текста: риски, возможности или нейтрально"""
+        if self.sentiment_analyzer is not None:
+            try:
+                result = self.sentiment_analyzer(text)[0]
+                label = result['label']
+                score = result['score']
+                
+                # Преобразуем в нашу систему категорий
+                if label == 'POSITIVE' and score > 0.7:
+                    return 'opportunity'
+                elif label == 'NEGATIVE' and score > 0.7:
+                    return 'risk'
+                else:
+                    return 'neutral'
+            except:
+                pass
+        
+        # Rule-based подход
+        opportunity_words = ['opportunity', 'benefit', 'advantage', 'growth', 'positive',
+                           'возможность', 'преимущество', 'выгода', 'рост', 'позитив']
+        risk_words = ['risk', 'threat', 'danger', 'problem', 'negative', 'challenge',
+                     'риск', 'угроза', 'опасность', 'проблема', 'негатив', 'вызов']
+        
+        text_lower = text.lower()
+        opportunity_count = sum(1 for word in opportunity_words if word in text_lower)
+        risk_count = sum(1 for word in risk_words if word in text_lower)
+        
+        if opportunity_count > risk_count and opportunity_count > 0:
+            return 'opportunity'
+        elif risk_count > opportunity_count and risk_count > 0:
+            return 'risk'
+        else:
+            return 'neutral'
+    
+    def predict_commitment(self, text):
+        """Определяем, содержит ли текст обещания"""
+        # Список слов, которые указывают на обещания
+        commitment_keywords = [
+            'commit', 'pledge', 'target', 'goal', 'will reduce', 'will achieve',
+            'plan to', 'strategy to', 'aim to', 'objective to', 'promise',
+            'обещаем', 'цель', 'сократим', 'достигнем', 'планируем', 'обязуем',
+            'намерены', 'стремимся', 'гарантируем', 'обеспечим'
+        ]
+        
+        # Паттерны для будущих действий
+        future_patterns = [
+            r'will\s+\w+', r'plan to', r'aim to', r'target to',
+            r'будем\s+\w+', r'планируем\s+\w+', r'собираемся\s+\w+'
+        ]
+        
+        text_lower = text.lower()
+        
+        # Проверяем ключевые слова
+        keyword_match = any(keyword in text_lower for keyword in commitment_keywords)
+        
+        # Проверяем паттерны будущих действий
+        pattern_match = any(re.search(pattern, text_lower) for pattern in future_patterns)
+        
+        return keyword_match or pattern_match
+    
+    def predict_specificity(self, text):
+        """Определяем конкретность обещаний"""
+        # Признаки конкретных обещаний: цифры, сроки, суммы, метрики
+        numeric_patterns = [
+            r'\d+\s*%', r'\d+\s*(million|billion|тысяч|миллион|миллиард)',
+            r'\d+\s*(dollars|euros|евро|долларов)', r'\d+\s*(tons|tonnes|тонн)',
+            r'by\s+20\d{2}', r'к\s+20\d{2}', r'в\s+20\d{2}'
+        ]
+        
+        specific_indicators = [
+            'target of', 'reduce by', 'invest', 'deadline', 'timeline',
+            'цель', 'сократить на', 'инвестируем', 'срок', 'график'
+        ]
+        
+        text_lower = text.lower()
+        
+        # Проверяем числовые паттерны
+        numeric_match = any(re.search(pattern, text_lower) for pattern in numeric_patterns)
+        
+        # Проверяем специфические индикаторы
+        indicator_match = any(indicator in text_lower for indicator in specific_indicators)
+        
+        return numeric_match or indicator_match
+    
+    def analyze_text(self, text):
+        """ПОЛНЫЙ АНАЛИЗ ТЕКСТА ПО МЕТОДОЛОГИИ СТАТЬИ"""
+        
+        # Начинаем с пустого результата
+        result = {
+            'text': text,
+            'is_climate_related': False,  # о климате
+            'sentiment': 'neutral',       # тональность
+            'is_commitment': False,       # наличие обещания
+            'is_specific': False,         # конкретность
+            'is_cheap_talk': False        # дешевый разговор
+        }
+        
+        # ШАГ 1: Проверяем, о климате ли текст
+        result['is_climate_related'] = self.predict_climate(text)
+        
+        # Если текст о климате, продолжаем анализ
+        if result['is_climate_related']:
+            # ШАГ 2: Определяем тональность
+            result['sentiment'] = self.predict_sentiment(text)
+            
+            # ШАГ 3: Ищем обещания
+            result['is_commitment'] = self.predict_commitment(text)
+            
+            # Если есть обещания, проверяем их конкретность
+            if result['is_commitment']:
+                # ШАГ 4: Определяем конкретность
+                result['is_specific'] = self.predict_specificity(text)
+                # "Дешевый разговор" = обещание есть, но оно не конкретное
+                result['is_cheap_talk'] = not result['is_specific']
+        
+        return result
+
+# Инициализируем модель
+model = ClimateCheapTalkModel()
+
+# 3. ТЕСТИРУЕМ МОДЕЛЬ НА ОБУЧАЮЩИХ ДАННЫХ
+
+def test_model_on_dataset(model, dataset):
+    
+    results = []
+    
+    # Проходим по всем примерам в датасете
+    for idx, row in dataset.iterrows():
+        text = row['text']
+        
+        # Истинные метки (то, что должно быть)
+        true_labels = {
+            'climate_related': row['climate_related'],
+            'sentiment': row['sentiment'],
+            'commitment': row['commitment'],
+            'specific': row['specific']
+        }
+        
+        # Получаем предсказания модели
+        prediction = model.analyze_text(text)
+        
+        # Сравниваем предсказания с истинными метками
+        result = {
+            'text': text[:100] + '...' if len(text) > 100 else text,  # Обрезаем длинный текст
+            'true_climate': true_labels['climate_related'],
+            'pred_climate': prediction['is_climate_related'],
+            'true_sentiment': true_labels['sentiment'],
+            'pred_sentiment': prediction['sentiment'],
+            'true_commitment': true_labels['commitment'],
+            'pred_commitment': prediction['is_commitment'],
+            'true_specific': true_labels['specific'],
+            'pred_specific': prediction['is_specific'],
+            # Проверяем правильность предсказаний
+            'climate_correct': true_labels['climate_related'] == prediction['is_climate_related'],
+            'sentiment_correct': true_labels['sentiment'] == prediction['sentiment'],
+            'commitment_correct': true_labels['commitment'] == prediction['is_commitment'],
+            'specific_correct': true_labels['specific'] == prediction['is_specific']
+        }
+        
+        results.append(result)
+    
+    return pd.DataFrame(results)
+
+# Запускаем тестирование
+test_results = test_model_on_dataset(model, dataset)
+
+# Анализируем результаты тестирования
+print(f"Точность определения климатических текстов: {test_results['climate_correct'].mean():.1%}")
+print(f"Точность определения тональности: {test_results['sentiment_correct'].mean():.1%}")
+print(f"Точность определения обещаний: {test_results['commitment_correct'].mean():.1%}")
+print(f"Точность определения конкретности: {test_results['specific_correct'].mean():.1%}")
+
+# Показываем несколько примеров работы модели
+for i in range(min(5, len(test_results))):
+    row = test_results.iloc[i]
+    print(f"\nТекст: {row['text']}")
+    print(f"Климат: Должно быть={row['true_climate']}, Модель сказала={row['pred_climate']} {'✓' if row['climate_correct'] else '✗'}")
+    
+    if row['true_climate']:
+        print(f"Тон: Должно быть={row['true_sentiment']}, Модель сказала={row['pred_sentiment']} {'✓' if row['sentiment_correct'] else '✗'}")
+        print(f"Обещание: Должно быть={row['true_commitment']}, Модель сказала={row['pred_commitment']} {'✓' if row['commitment_correct'] else '✗'}")
+        if row['true_commitment']:
+            print(f"Конкретность: Должно быть={row['true_specific']}, Модель сказала={row['pred_specific']} {'✓' if row['specific_correct'] else '✗'}")
+
+# 4. СЧИТАЕМ ИНДЕКС "ДЕШЕВЫХ РАЗГОВОРОВ"
+
+def calculate_cheap_talk_metrics(results_df):
+    
+    # Берем только тексты о климате
+    climate_related = results_df[results_df['true_climate'] == 1]
+    
+    # Из них берем только тексты с обещаниями
+    commitments = climate_related[climate_related['true_commitment'] == 1]
+    
+    if len(commitments) == 0:
+        return 0.0, 0, 0
+    
+    # Находим расплывчатые обещания
+    non_specific_commitments = commitments[commitments['true_specific'] == 0]
+    
+    # Рассчитываем индекс: (Расплывчатые обещания) / (Все обещания)
+    cheap_talk_index = len(non_specific_commitments) / len(commitments)
+    
+    return cheap_talk_index, len(commitments), len(non_specific_commitments)
+
+# Считаем метрики для датасета
+cti, total_commitments, non_specific = calculate_cheap_talk_metrics(test_results)
+
+print(f"Всего текстов о климате: {len(test_results[test_results['true_climate'] == 1])}")
+print(f"Всего обещаний: {total_commitments}")
+print(f"Расплывчатых обещаний: {non_specific}")
+print(f"Индекс 'дешевых разговоров' (CTI): {cti:.1%}")
+
+# 5. ДЕМОНСТРАЦИЯ НА НОВЫХ ТЕКСТАХ
+
+test_texts = [
+    "Мы планируем достичь нулевых выбросов к 2050 году, инвестируя 5 миллиардов долларов в солнечную энергию.",  # Конкретное обещание
+    "Компания стремится к экологической устойчивости и будет работать над улучшением своих экологических показателей.",  # Дешевый разговор
+    "Финансовые результаты показали рост прибыли на 20% в прошлом квартале.",  # Не о климате
+    "Изменение климата представляет серьезные риски для нашего бизнеса, и мы разрабатываем стратегию адаптации.",  # Климат, но не обещание
+]
+
+for text in test_texts:
+    result = model.analyze_text(text)
+    print(f"\nТекст: {text}")
+    print(f"Климатический: {result['is_climate_related']}")
+    if result['is_climate_related']:
+        print(f"Тон: {result['sentiment']}")
+        print(f"Обещание: {result['is_commitment']}")
+        if result['is_commitment']:
+            print(f"Конкретное: {result['is_specific']}")
+            print(f"Дешевый разговор: {result['is_cheap_talk']}")
